@@ -1,4 +1,4 @@
-This is a attemp to create a gpu passthrough without legacy vga accesses to graphics card.
+This is an attemp to create a gpu passthrough without legacy vga accesses to graphics card.
 
 Legacy accesses to vga registers are replaced through MMIO accesses(BAR2).
 E.g. 0x3cc to MMIOBASE+0x3cc
@@ -112,3 +112,17 @@ Testing Windows:
       BAR6: 32 bit memory at 0xffffffffffffffff [0x0001fffe].
       id ""
 
+My Configuration:
+
+i7-3820
+Asrock X79 Extreme6
+Radeon 6950, 2:00.0, boot card, primary card, passthrough card
+Radeon 5450, 1:00.0, card for linux desktop
+
+cat /proc/cmdline 
+BOOT_IMAGE=/boot/kernel-3.19 root=/dev/sda1 raid=noautodetect pci-stub.ids=1002:6719,1002:aa80 fbcon=map:1 intel_iommu=on vga=0
+
+No initrd, pcistub in kernel
+
+My tip:
+Switch to S3(suspend to ram) to deinit graphics card before restart the virtual machine.
