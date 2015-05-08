@@ -1,0 +1,114 @@
+This is a attemp to create a gpu passthrough without legacy vga accesses to graphics card.
+
+Legacy accesses to vga registers are replaced through MMIO accesses(BAR2).
+E.g. 0x3cc to MMIOBASE+0x3cc
+
+Legacy accesses to 0xA0000 region are replaced through accesses to plain framebuffer(BAR0).
+
+Memory Map in textmode 03h:
+
+A0000 Region:
+
+0000: c0 a0 c1 a1 c2 a2 c3 a3 planes 0 and 1
+0000: f0 f1	              plane 2 (font, hidden)
+
+Framebuffer:
+
+0000: c0 a0 f0 xx xx xx f1 xx c1 a1
+
+c0 - cx: character bytes
+a0 - ax: attribute bytes (colors)
+f0 - fx: font bytes
+
+QEMU 2.1.3 monitor - type 'help' for more information
+(qemu) x /32b 0xb8000
+00000000000b8000: 0x53 0x07 0x65 0x07 0x61 0x07 0x42 0x07
+00000000000b8008: 0x49 0x07 0x4f 0x07 0x53 0x07 0x20 0x07
+00000000000b8010: 0x28 0x07 0x76 0x07 0x65 0x07 0x72 0x07
+00000000000b8018: 0x73 0x07 0x69 0x07 0x6f 0x07 0x6e 0x07
+(qemu) x /32b 0xe0000000
+00000000e0000000: 0x53 0x07 0x00 0xff 0x75 0x38 0x00 0xff
+00000000e0000008: 0x65 0x07 0x00 0xff 0x75 0x38 0x00 0xff
+00000000e0000010: 0x61 0x07 0x00 0xff 0x75 0x38 0x00 0xff
+00000000e0000018: 0x42 0x07 0x00 0xff 0x75 0x38 0x00 0xff
+
+
+
+Code is primary for radeon cards.
+0x3c3 quirk is hardcoded in pci-assign
+
+Current Status:
+Standard DOS mode (text mode 03h) works
+Standard VGA mode (graphics mode 12h) works partially 
+
+Windows Xp starts without boot logo
+Windows 7 starts without boot logo, black screen until radeon driver loads
+
+Testing DOS:
+
+x86_64-softmmu/qemu-system-x86_64 -spice port=5900,disable-ticketing,seamless-migration=on  \
+-netdev tap,id=hostnet0 -device virtio-net,netdev=hostnet0,id=net0,mac=xx:xx:xx:xx:xx:xx \
+-chardev pipe,path=/tmp/qemudebugpipe,id=seabios -device isa-debugcon,iobase=0x402,chardev=seabios  \
+-cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time    -enable-kvm   -nodefaults -no-user-config  \
+-nographic   -monitor  telnet::4444,server,nowait  \
+-vga none -device pci-assign,host=02:00.0  \
+/home/ax/vm/dosplatte.img 
+
+
+Testing Windows:
+
+ x86_64-softmmu/qemu-system-x86_64 -name windows  -M pc-i440fx-1.4 -cpu qemu32 -enable-kvm \
+ -m 2048 -smp 2,sockets=2,cores=1,threads=1  -no-user-config -nodefaults   \
+ -monitor telnet::4444,server,nowait  -rtc base=localtime -no-shutdown  \
+ -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2  \
+ -device virtio-serial-pci,id=virtio-serial0,bus=pci.0,addr=0x5  \
+ -drive file=vmWindows.img,if=none,id=drive-ide0-0-0,format=raw,cache=none  \
+ -device ide-hd,bus=ide.0,unit=0,drive=drive-ide0-0-0,id=ide0-0-0,bootindex=1  \
+ -drive if=none,id=drive-ide0-1-0,readonly=on,format=raw  \
+ -device ide-cd,bus=ide.1,unit=0,drive=drive-ide0-1-0,id=ide0-1-0  \
+ -drive file=develop.img,if=none,id=drive-virtio-disk0,format=raw,cache=none \
+ -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x8,drive=drive-virtio-disk0,id=virtio-disk0  \
+ -drive file=vs2010.img,if=none,id=drive-virtio-disk1,format=raw,cache=none  \
+ -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x9,drive=drive-virtio-disk1,id=virtio-disk1  \
+ -netdev tap,id=hostnet0 \
+ -device e1000,netdev=hostnet0,id=net0,mac=xx:xx:xx:xx:xx:xx,bus=pci.0,addr=0x3  \
+ -chardev pty,id=charserial0 \
+ -device isa-serial,chardev=charserial0,id=serial0 \
+ -chardev socket,id=charserial1,host=127.0.0.1,port=4555,server,nowait  \
+ -device isa-serial,chardev=charserial1,id=serial1 -chardev spicevmc,id=charchannel0,name=vdagent  \
+ -device virtserialport,bus=virtio-serial0.0,nr=1,chardev=charchannel0,id=channel0,name=com.redhat.spice.0  \
+ -spice port=5900,disable-ticketing,seamless-migration=on  \
+ -vga none -device pci-assign,host=02:00.0 \
+ -device pci-assign,host=00:1a.0,addr=1a.0,id=usb0  
+
+(qemu) info pci
+  Bus  0, device   0, function 0:
+    Host bridge: PCI device 8086:1237
+      id ""
+  Bus  0, device   1, function 0:
+    ISA bridge: PCI device 8086:7000
+      id ""
+  Bus  0, device   1, function 1:
+    IDE controller: PCI device 8086:7010
+      BAR4: I/O at 0xc120 [0xc12f].
+      id ""
+  Bus  0, device   1, function 3:
+    Bridge: PCI device 8086:7113
+      IRQ 9.
+      id ""
+  Bus  0, device   2, function 0:
+    Ethernet controller: PCI device 1af4:1000
+      IRQ 10.
+      BAR0: I/O at 0xc100 [0xc11f].
+      BAR1: 32 bit memory at 0xfebc0000 [0xfebc0fff].
+      BAR6: 32 bit memory at 0xffffffffffffffff [0x0003fffe].
+      id "net0"
+  Bus  0, device   3, function 0:
+    VGA controller: PCI device 1002:6719
+      IRQ 11.
+      BAR0: 64 bit prefetchable memory at 0xe0000000 [0xefffffff].
+      BAR2: 64 bit memory at 0xfeb80000 [0xfeb9ffff].
+      BAR4: I/O at 0xc000 [0xc0ff].
+      BAR6: 32 bit memory at 0xffffffffffffffff [0x0001fffe].
+      id ""
+

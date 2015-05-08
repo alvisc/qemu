@@ -59,6 +59,19 @@
 #define DEBUG(fmt, ...)
 #endif
 
+typedef struct AssignedDevVgaRegion {
+    MemoryRegion mem;
+    off_t offset;
+    int nr;
+    //QLIST_HEAD(, VFIOQuirk) quirks;
+} AssignedDevVgaRegion;
+
+typedef struct AssignedDevVga {
+    off_t fd_offset;
+    int fd;
+    AssignedDevVgaRegion region[QEMU_PCI_VGA_NUM_REGIONS];
+} AssignedDevVga;
+
 typedef struct PCIRegion {
     int type;           /* Memory or port I/O */
     int valid;
@@ -117,6 +130,7 @@ typedef struct AssignedDevice {
     uint32_t features;
     int intpin;
     AssignedDevRegion v_addrs[PCI_NUM_REGIONS - 1];
+    AssignedDevVga vga;
     PCIDevRegions real_device;
     PCIINTxRoute intx_route;
     AssignedIRQType assigned_irq_type;
@@ -146,6 +160,7 @@ static void assigned_dev_update_irq_routing(PCIDevice *dev);
 static void assigned_dev_load_option_rom(AssignedDevice *dev);
 
 static void assigned_dev_unregister_msix_mmio(AssignedDevice *dev);
+
 
 static uint64_t assigned_dev_ioport_rw(AssignedDevRegion *dev_region,
                                        hwaddr addr, int size,
@@ -253,6 +268,307 @@ static const MemoryRegionOps slow_bar_ops = {
     },
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
+
+
+
+
+static unsigned writeplanes=0;
+
+//00b -- A0000h-BFFFFh (128K region)
+//01b -- A0000h-AFFFFh (64K region)
+//10b -- B0000h-B7FFFh (32K region)
+//11b -- B8000h-BFFFFh (32K region)
+static unsigned mapSelect=0;
+
+
+static void  vfio_vga_write(void *opaque, hwaddr addr,
+                           uint64_t data, unsigned size)
+{
+    AssignedDevVgaRegion *region = opaque;
+    AssignedDevVga *vga = container_of(region, AssignedDevVga, region[region->nr]);
+    AssignedDevice *pci_dev = ((void*)vga) - offsetof(AssignedDevice,vga);
+    AssignedDevRegion *fb_region=&(pci_dev->v_addrs[0]);
+    AssignedDevRegion *mmio_region=&(pci_dev->v_addrs[2]);
+    off_t offset;
+
+    union {
+        uint8_t byte;
+        union {
+            uint16_t word;
+            struct{
+                uint8_t lobyte;
+                uint8_t hibyte;
+            };
+        };
+        union {
+            uint32_t dword;
+            struct{
+                uint16_t loword;
+                uint16_t hiword;
+            };
+        };
+
+        uint64_t qword;
+    } buf;
+
+
+
+    offset = region->mem.addr + addr;
+
+    if(region->nr>0)
+    {
+
+        switch (size) {
+        case 1:
+            buf.byte = data;
+            slow_bar_writeb(mmio_region,offset,buf.dword);
+            break;
+        case 2:
+            buf.word = cpu_to_le16(data);
+            slow_bar_writew(mmio_region,offset,buf.dword);
+            if(offset ==0x3c4)
+            {
+                if((data&0xff)==0x02)
+                {
+                    writeplanes = (data>>8);
+                    DEBUG("select write planes 0x%x\n",writeplanes);
+                }
+            }
+            if(offset==0x3ce)
+            {
+                if((data&0xff)==0x06)
+                {
+                    mapSelect = (data>>10);
+                    DEBUG("select Memory Map %i\n",mapSelect);
+                }
+            }
+            break;
+        case 4:
+            buf.dword = cpu_to_le32(data);
+            slow_bar_writel(mmio_region,offset,buf.dword);
+            #if 0
+            break;
+            #endif
+        default:
+            hw_error("vfio: unsupported write size, %d bytes", size);
+            break;
+
+        }
+
+        return;
+    }
+
+
+    switch (size) {
+    case 1:
+        buf.byte = data;
+        break;
+    case 2:
+        buf.word = cpu_to_le16(data);
+        break;
+    case 4:
+        buf.dword = cpu_to_le32(data);
+        break;
+    default:
+        hw_error("vfio: unsupported write size, %d bytes", size);
+        break;
+    }
+
+    if(mapSelect>1)
+    {
+        addr&=0x7fff;
+    }
+    else
+    {
+        addr&=0xffff;
+    }
+
+    offset=addr*4;
+
+    switch(writeplanes){
+        case 0: //no write
+        {
+            break;
+        }
+        case 1: //plane 0
+        case 2: //plane 1
+        case 4: //plane 2
+        case 8: //plane 3
+        {
+            offset=addr*4+(writeplanes>>1);
+
+            switch (size) {
+                case 1:
+                    slow_bar_writeb(fb_region,offset,buf.dword);
+                    #if 1
+                    break;
+                    #endif
+                case 2:
+                    //break;
+                case 4:
+                    //buf.dword = cpu_to_le32(data);
+                    //break;
+                default:
+                    hw_error("vfio: unsupported write size, %d bytes", size);
+                    break;
+            }
+            break;
+        }
+        case 0xf:
+        {
+            offset=addr*4;
+            while(size)
+            {
+                buf.lobyte=data;
+                buf.hibyte=data;
+                buf.hiword=buf.loword;
+                slow_bar_writel(fb_region,offset,buf.dword);
+                data=data>>8;
+                offset+=4;
+                size--;
+            }
+
+            break;
+        }
+        case 0x7:
+        {
+            offset=addr*4;
+            buf.lobyte=data;
+            buf.hibyte=data;
+            slow_bar_writew(fb_region,offset,buf.dword);
+            slow_bar_writeb(fb_region,offset+2,buf.dword);
+            break;
+        }
+        default:
+        {
+
+            offset = (addr&0xfffe)*4;
+
+            switch (size) {
+                case 1:
+                    offset+=addr&0x1;
+                    slow_bar_writeb(fb_region,offset,buf.dword);
+                    #if 1
+                    break;
+                    #endif
+                case 2:
+                    offset+=addr&0x1;
+                    slow_bar_writew(fb_region,offset,buf.dword);
+                    break;
+                case 4:
+                    slow_bar_writew(fb_region,offset,buf.loword);
+                    slow_bar_writew(fb_region,offset+8,buf.hiword);
+                    break;
+                default:
+                    hw_error("vfio: unsupported write size, %d bytes", size);
+                    break;
+            }
+        }
+    }
+}
+
+static uint64_t vfio_vga_read(void *opaque, hwaddr addr, unsigned size)
+{
+    AssignedDevVgaRegion *region = opaque;
+    AssignedDevVga *vga = container_of(region, AssignedDevVga, region[region->nr]);
+    AssignedDevice *pci_dev = ((void*)vga) - offsetof(AssignedDevice,vga);
+    AssignedDevRegion *fb_region=&(pci_dev->v_addrs[0]);
+    //AssignedDevRegion *mmio_region=&(pci_dev->v_addrs[2]);
+
+
+    uint64_t data;
+
+    union {
+        uint8_t byte;
+        uint16_t word;
+        union {
+            uint32_t dword;
+            struct{
+                uint16_t loword;
+                uint16_t hiword;
+            };
+        };
+
+        uint64_t qword;
+    } buf;
+    off_t offset;
+
+    if((region->nr==0))
+    {
+        if(mapSelect>1)
+        {
+            addr&=0x7fff;
+        }
+        else
+        {
+            addr&=0xffff;
+        }
+
+        offset = (addr&0xfffe)*4;
+        switch (size) {
+            case 1:
+                offset+=addr&0x1;
+                buf.byte=slow_bar_readb(fb_region,offset);
+                data = buf.byte;
+                #if 1
+                break;
+                #endif
+            case 2:
+                offset+=addr&0x1;
+                buf.word=slow_bar_readw(fb_region,offset);
+                data = le16_to_cpu(buf.word);
+                break;
+            case 4:
+                buf.loword=slow_bar_readw(fb_region,offset);
+                buf.hiword=slow_bar_readw(fb_region,offset+8);
+                data = le32_to_cpu(buf.dword);
+                break;
+            default:
+                hw_error("vfio: unsupported write size, %d bytes", size);
+                break;
+        }
+        return data;
+
+    }
+
+
+    if(region->nr>0)
+    {
+        if((region->mem.addr + addr) == 0x3c3)  //radeon quirk
+        {
+
+            uint8_t val = pci_dev->dev.io_regions[4].addr>>8;
+            return val;
+        }
+        buf.word = *(uint16_t*)(pci_dev->v_addrs[2].u.r_virtbase + (region->mem.addr + addr));
+    }
+
+
+    switch (size) {
+    case 1:
+        data = buf.byte;
+        break;
+    case 2:
+        data = le16_to_cpu(buf.word);
+        break;
+    case 4:
+        data = le32_to_cpu(buf.dword);
+        break;
+    default:
+        hw_error("vfio: unsupported read size, %d bytes", size);
+        break;
+    }
+
+    return data;
+}
+
+static const MemoryRegionOps vfio_vga_ops = {
+    .read = vfio_vga_read,
+    .write = vfio_vga_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+
 
 static void assigned_dev_iomem_setup(PCIDevice *pci_dev, int region_num,
                                      pcibus_t e_size)
@@ -401,6 +717,7 @@ static void assigned_dev_register_regions(PCIRegion *io_regions,
 {
     uint32_t i;
     PCIRegion *cur_region = io_regions;
+    uint8_t devclass = pci_dev->dev.config[0xb];
 
     for (i = 0; i < regions_num; i++, cur_region++) {
         if (!cur_region->valid) {
@@ -496,6 +813,41 @@ static void assigned_dev_register_regions(PCIRegion *io_regions,
         }
     }
 
+
+    //if(pci_dev->dev.has_vga)
+    if(devclass==3)
+    {
+        memory_region_init_io(&pci_dev->vga.region[QEMU_PCI_VGA_MEM].mem,
+                              OBJECT(pci_dev), &vfio_vga_ops,
+                              &pci_dev->vga.region[QEMU_PCI_VGA_MEM],
+                              "vfio-vga-mmio@0xa0000",
+                              QEMU_PCI_VGA_MEM_SIZE);
+
+        pci_dev->vga.region[QEMU_PCI_VGA_MEM].nr=QEMU_PCI_VGA_MEM;
+
+        memory_region_init_io(&pci_dev->vga.region[QEMU_PCI_VGA_IO_LO].mem,
+                              OBJECT(pci_dev), &vfio_vga_ops,
+                              &pci_dev->vga.region[QEMU_PCI_VGA_IO_LO],
+                              "vfio-vga-io@0x3b0",
+                              QEMU_PCI_VGA_IO_LO_SIZE);
+
+        pci_dev->vga.region[QEMU_PCI_VGA_IO_LO].nr=QEMU_PCI_VGA_IO_LO;
+
+        memory_region_init_io(&pci_dev->vga.region[QEMU_PCI_VGA_IO_HI].mem,
+                              OBJECT(pci_dev), &vfio_vga_ops,
+                              &pci_dev->vga.region[QEMU_PCI_VGA_IO_HI],
+                              "vfio-vga-io@0x3c0",
+                              QEMU_PCI_VGA_IO_HI_SIZE);
+
+        pci_dev->vga.region[QEMU_PCI_VGA_IO_HI].nr=QEMU_PCI_VGA_IO_HI;
+
+        pci_register_vga(&pci_dev->dev, &pci_dev->vga.region[QEMU_PCI_VGA_MEM].mem,
+                         &pci_dev->vga.region[QEMU_PCI_VGA_IO_LO].mem,
+                         &pci_dev->vga.region[QEMU_PCI_VGA_IO_HI].mem);
+       //vfio_vga_quirk_setup(vdev);
+
+        DEBUG("fd_offset: 0x%x offset: 0x%x \n", pci_dev->vga.fd_offset, pci_dev->vga.region[QEMU_PCI_VGA_MEM].offset );
+    }
     /* success */
 }
 
@@ -551,6 +903,8 @@ static void get_real_device(AssignedDevice *pci_dev, Error **errp)
 
     snprintf(name, sizeof(name), "%sconfig", dir);
 
+
+
     if (pci_dev->configfd_name && *pci_dev->configfd_name) {
         dev->config_fd = monitor_handle_fd_param2(cur_mon,
                                                   pci_dev->configfd_name,
@@ -595,6 +949,7 @@ again:
 
     snprintf(name, sizeof(name), "%sresource", dir);
 
+
     f = fopen(name, "r");
     if (f == NULL) {
         error_setg_file_open(errp, errno, name);
@@ -622,6 +977,8 @@ again:
             flags &= ~IORESOURCE_PREFETCH;
         }
         snprintf(name, sizeof(name), "%sresource%d", dir, r);
+
+
         fd = open(name, O_RDWR);
         if (fd == -1) {
             continue;
@@ -637,7 +994,6 @@ again:
               " type %d resource_fd %d\n",
               r, rp->size, start, rp->type, rp->resource_fd);
     }
-
     fclose(f);
 
     /* read and fill vendor ID */
@@ -728,6 +1084,8 @@ static void free_assigned_device(AssignedDevice *dev)
     }
 
     if (dev->real_device.config_fd >= 0) {
+
+
         close(dev->real_device.config_fd);
     }
 
